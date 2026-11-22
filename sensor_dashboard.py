@@ -8,10 +8,12 @@ CSV 파일로 불러와서 그래프와 통계로 보여 줍니다.
     python sensor_dashboard.py
     python sensor_dashboard.py data.csv          # 시작하면서 CSV 열기
 """
+import os
 import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+import numpy as np
 import matplotlib
 from matplotlib import font_manager
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -41,6 +43,8 @@ class Dashboard(tk.Tk):
 
         self.ds = None                 # 현재 화면에 그리는 데이터
         self.ch_vars = {}
+        self.processed = {}
+        self.summary_rows = []
         self._dirty = True
 
         self._build_ui()
@@ -59,6 +63,7 @@ class Dashboard(tk.Tk):
         bar = ttk.Frame(self, padding=(10, 8))
         bar.pack(side=tk.TOP, fill=tk.X)
         ttk.Button(bar, text="CSV 열기", command=self.open_csv).pack(side=tk.LEFT)
+        ttk.Button(bar, text="엑셀로 내보내기", command=self.export).pack(side=tk.LEFT, padx=8)
 
         body = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True, padx=10)
@@ -70,6 +75,18 @@ class Dashboard(tk.Tk):
         self.ch_frame = ttk.Frame(side)
         self.ch_frame.pack(fill=tk.X, pady=(2, 10))
         ttk.Label(self.ch_frame, text="데이터를 불러오세요", foreground="#777").pack(anchor=tk.W)
+
+        ttk.Label(side, text="처리", font=("", 10, "bold")).pack(anchor=tk.W)
+        self.v_outlier = tk.BooleanVar(value=True)
+        ttk.Checkbutton(side, text="이상치 제거 (Hampel)", variable=self.v_outlier, command=self._mark).pack(anchor=tk.W)
+        self.v_hampel = tk.IntVar(value=7)
+        self._slider(side, "이상치 판단 창", self.v_hampel, 3, 31)
+        self.v_smooth = tk.IntVar(value=5)
+        self._slider(side, "이동평균 창", self.v_smooth, 1, 51)
+        self.v_raw = tk.BooleanVar(value=True)
+        ttk.Checkbutton(side, text="원본도 흐리게 표시", variable=self.v_raw, command=self._mark).pack(anchor=tk.W)
+        self.v_alt = tk.BooleanVar(value=False)
+        ttk.Checkbutton(side, text="기압 → 상대 고도(m) 변환", variable=self.v_alt, command=self._mark).pack(anchor=tk.W)
 
         ttk.Label(side, text="도움말", font=("", 10, "bold")).pack(anchor=tk.W, pady=(12, 0))
         ttk.Label(side, wraplength=230, foreground="#555", justify=tk.LEFT, text=(
@@ -88,8 +105,8 @@ class Dashboard(tk.Tk):
 
         table_frame = ttk.Frame(right)
         right.add(table_frame, weight=1)
-        cols = ("unit", "mean", "std", "min", "max")
-        heads = ("단위", "평균", "표준편차", "최소", "최대")
+        cols = ("unit", "mean", "std", "min", "max", "freq", "outliers")
+        heads = ("단위", "평균", "표준편차", "최소", "최대", "주 주파수 (Hz)", "제거한 이상치")
         self.table = ttk.Treeview(table_frame, columns=cols, height=5)
         self.table.heading("#0", text="채널")
         self.table.column("#0", width=200)
@@ -100,6 +117,23 @@ class Dashboard(tk.Tk):
 
         self.status = tk.StringVar(value="phyphox에서 내보낸 CSV를 열어 주세요.")
         ttk.Label(self, textvariable=self.status, padding=(10, 4), relief=tk.SUNKEN, anchor=tk.W).pack(side=tk.BOTTOM, fill=tk.X)
+
+    def _slider(self, parent, label, var, lo, hi):
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=1)
+        ttk.Label(row, text=label).pack(side=tk.LEFT)
+        val = ttk.Label(row, width=4, anchor=tk.E)
+        val.pack(side=tk.RIGHT)
+
+        def on(_=None):
+            v = int(round(float(scale.get())))
+            var.set(v)
+            val.config(text=str(v))
+            self._mark()
+        scale = ttk.Scale(parent, from_=lo, to=hi, command=on)
+        scale.set(var.get())
+        scale.pack(fill=tk.X)
+        val.config(text=str(var.get()))
 
     def _mark(self):
         self._dirty = True
@@ -149,6 +183,7 @@ class Dashboard(tk.Tk):
         ds = self.ds
         sel = [n for n, v in self.ch_vars.items() if v.get() and n in ds.channels][:MAX_PLOTS]
         self.fig.clear()
+        self.processed, self.summary_rows = {}, []
         for row in self.table.get_children():
             self.table.delete(row)
         if not sel or len(ds) < 2:
@@ -158,18 +193,61 @@ class Dashboard(tk.Tk):
         step = max(1, len(ds) // MAX_DRAW_POINTS)
         t = ds.t
         for i, (ax, ch) in enumerate(zip(axes, sel)):
-            y, unit = ds.channels[ch]
-            ax.plot(t[::step], y[::step], color=COLORS[i % len(COLORS)], lw=1.0)
-            ax.set_ylabel(f"{ch}\n({unit})" if unit else ch, fontsize=8)
+            p = sl.process(ds, ch, outlier=self.v_outlier.get(), hampel_window=self.v_hampel.get(),
+                           smooth=self.v_smooth.get(), altitude=self.v_alt.get())
+            self.processed[ch] = p
+            col = COLORS[i % len(COLORS)]
+            if self.v_raw.get():
+                ax.plot(t[::step], p["raw"][::step], color=col, alpha=0.25, lw=0.8)
+            ax.plot(t[::step], p["smooth"][::step], color=col, lw=1.4)
+            if p["outliers"].any():
+                ax.plot(t[p["outliers"]], p["raw"][p["outliers"]], "x", color="#c0392b", ms=5)
+            ax.set_ylabel(f"{p['label']}\n({p['unit']})" if p["unit"] else p["label"], fontsize=8)
             ax.grid(alpha=0.3)
             ax.tick_params(labelsize=8)
-            st = sl.stats(y)
-            self.table.insert("", tk.END, text=ch, values=(
-                unit, *(f"{v:.4g}" for v in (st["mean"], st["std"], st["min"], st["max"]))))
+            st = sl.stats(p["smooth"])
+            f = sl.dominant_frequency(t, p["clean"])
+            n_out = int(p["outliers"].sum())
+            row = [p["label"], p["unit"], st["mean"], st["std"], st["min"], st["max"], f, n_out]
+            self.summary_rows.append(row)
+            self.table.insert("", tk.END, text=p["label"], values=(
+                p["unit"], *(f"{v:.4g}" for v in (st["mean"], st["std"], st["min"], st["max"])),
+                "–" if np.isnan(f) else f"{f:.3f}", n_out))
         axes[-1].set_xlabel("Time (s)")
         self.fig.suptitle(ds.title, fontsize=10)
         self.fig.tight_layout()
         self.canvas.draw_idle()
+
+    # -------------------------------------------------------------- 내보내기
+    def export(self):
+        ds = self.ds
+        if ds is None or len(ds) < 2:
+            messagebox.showinfo("내보내기", "내보낼 데이터가 없어요.")
+            return
+        sel = [n for n, v in self.ch_vars.items() if v.get() and n in ds.channels] or ds.names()
+        path = filedialog.asksaveasfilename(title="저장", defaultextension=".xlsx",
+                                            initialfile=os.path.splitext(ds.title)[0] + "_분석",
+                                            filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv")])
+        if not path:
+            return
+        try:
+            processed, rows = self.build_export(ds, sel)
+            sl.export(path, ds, processed, rows)
+        except Exception as e:
+            messagebox.showerror("저장 실패", str(e))
+            return
+        self.status.set(f"저장했어요: {path}")
+
+    def build_export(self, ds, sel):
+        processed, rows = {}, []
+        for ch in sel:
+            p = sl.process(ds, ch, outlier=self.v_outlier.get(), hampel_window=self.v_hampel.get(),
+                           smooth=self.v_smooth.get(), altitude=self.v_alt.get())
+            processed[ch] = p
+            st = sl.stats(p["smooth"])
+            rows.append([p["label"], p["unit"], st["mean"], st["std"], st["min"], st["max"],
+                         sl.dominant_frequency(ds.t, p["clean"]), int(p["outliers"].sum())])
+        return processed, rows
 
     def _on_close(self):
         self.destroy()
