@@ -2,11 +2,12 @@
 GUI 기반 센서 데이터 통합 대시보드 (교육용)
 
 스마트폰 phyphox 앱의 센서 데이터(가속도, 조도, 기압, 자기장 등)를
-CSV 파일로 불러와서 그래프와 통계로 보여 줍니다.
+CSV 파일로 불러오거나 실시간으로 받아서 그래프와 통계로 보여 줍니다.
 
 실행
     python sensor_dashboard.py
     python sensor_dashboard.py data.csv          # 시작하면서 CSV 열기
+    python sensor_dashboard.py --demo            # 시뮬레이션 데이터로 바로 시작
 """
 import os
 import sys
@@ -41,7 +42,11 @@ class Dashboard(tk.Tk):
         self.geometry("1280x820")
         self.minsize(1000, 640)
 
-        self.ds = None                 # 현재 화면에 그리는 데이터
+        self.ds = None                 # 현재 화면에 그리는 데이터 (CSV 또는 실시간 스냅숏)
+        self.source = None             # 실시간 수집 스레드
+        self.buf = sl.LiveBuffer()
+        self.rec_start = None          # 기록 시작 시각 (실시간 시간축 기준)
+        self.recorded = None           # 기록 정지 후 확정된 구간
         self.ch_vars = {}
         self.processed = {}
         self.summary_rows = []
@@ -63,7 +68,20 @@ class Dashboard(tk.Tk):
         bar = ttk.Frame(self, padding=(10, 8))
         bar.pack(side=tk.TOP, fill=tk.X)
         ttk.Button(bar, text="CSV 열기", command=self.open_csv).pack(side=tk.LEFT)
-        ttk.Button(bar, text="엑셀로 내보내기", command=self.export).pack(side=tk.LEFT, padx=8)
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        ttk.Label(bar, text="phyphox 주소").pack(side=tk.LEFT)
+        self.addr = tk.StringVar(value="192.168.0.10:8080")
+        ttk.Entry(bar, textvariable=self.addr, width=20).pack(side=tk.LEFT, padx=4)
+        self.btn_connect = ttk.Button(bar, text="실시간 연결", command=self.connect_phyphox)
+        self.btn_connect.pack(side=tk.LEFT)
+        self.btn_demo = ttk.Button(bar, text="데모(시뮬레이션)", command=self.start_demo)
+        self.btn_demo.pack(side=tk.LEFT, padx=4)
+        self.btn_stop = ttk.Button(bar, text="수집 중지", command=self.stop_live, state=tk.DISABLED)
+        self.btn_stop.pack(side=tk.LEFT)
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        self.btn_rec = ttk.Button(bar, text="● 기록 시작", command=self.toggle_record, state=tk.DISABLED)
+        self.btn_rec.pack(side=tk.LEFT)
+        ttk.Button(bar, text="엑셀로 내보내기", command=self.export).pack(side=tk.LEFT, padx=4)
 
         body = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True, padx=10)
@@ -88,10 +106,14 @@ class Dashboard(tk.Tk):
         self.v_alt = tk.BooleanVar(value=False)
         ttk.Checkbutton(side, text="기압 → 상대 고도(m) 변환", variable=self.v_alt, command=self._mark).pack(anchor=tk.W)
 
+        ttk.Label(side, text="실시간 표시", font=("", 10, "bold")).pack(anchor=tk.W, pady=(12, 0))
+        self.v_window = tk.IntVar(value=20)
+        self._slider(side, "최근 몇 초", self.v_window, 5, 120)
+
         ttk.Label(side, text="도움말", font=("", 10, "bold")).pack(anchor=tk.W, pady=(12, 0))
         ttk.Label(side, wraplength=230, foreground="#555", justify=tk.LEFT, text=(
-            "phyphox 앱에서 측정한 뒤 오른쪽 위 ⋮ → '데이터 내보내기' → "
-            "'CSV (쉼표, 소수점)'을 골라 PC로 옮기고 'CSV 열기'로 불러오세요.")).pack(anchor=tk.W)
+            "phyphox 앱에서 실험을 고르고 오른쪽 위 ⋮ → '원격 접속 허용'을 켜면 "
+            "화면에 주소가 나와요. PC와 폰이 같은 와이파이에 있어야 해요.")).pack(anchor=tk.W)
 
         # 가운데 그래프 + 아래 통계
         right = ttk.PanedWindow(body, orient=tk.VERTICAL)
@@ -115,7 +137,7 @@ class Dashboard(tk.Tk):
             self.table.column(c, width=110, anchor=tk.E)
         self.table.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
 
-        self.status = tk.StringVar(value="phyphox에서 내보낸 CSV를 열어 주세요.")
+        self.status = tk.StringVar(value="CSV를 열거나, phyphox에 연결하거나, 데모를 시작하세요.")
         ttk.Label(self, textvariable=self.status, padding=(10, 4), relief=tk.SUNKEN, anchor=tk.W).pack(side=tk.BOTTOM, fill=tk.X)
 
     def _slider(self, parent, label, var, lo, hi):
@@ -148,6 +170,8 @@ class Dashboard(tk.Tk):
         except Exception as e:
             messagebox.showerror("불러오기 실패", str(e))
             return
+        self.stop_live()
+        self.recorded = None
         self._set_dataset(ds)
         dur = ds.t[-1] - ds.t[0] if len(ds) else 0
         rate = (len(ds) - 1) / dur if dur > 0 else 0
@@ -169,15 +193,78 @@ class Dashboard(tk.Tk):
                 self.ch_vars[n] = v
         self._mark()
 
+    def start_demo(self):
+        self._start_source(sl.SimulatedSource(self.buf), "시뮬레이션 데이터 수집 중 (50 Hz)")
+
+    def connect_phyphox(self):
+        self._start_source(sl.PhyphoxSource(self.buf, self.addr.get()), f"{self.addr.get()} 연결 중…")
+
+    def _start_source(self, src, msg):
+        self.stop_live()
+        self.recorded, self.rec_start = None, None
+        self.source = src
+        src.start()
+        self.btn_stop.config(state=tk.NORMAL)
+        self.btn_rec.config(state=tk.NORMAL, text="● 기록 시작")
+        self.btn_connect.config(state=tk.DISABLED)
+        self.btn_demo.config(state=tk.DISABLED)
+        self.status.set(msg)
+
+    def stop_live(self):
+        if self.source:
+            self.source.stop()
+            self.source = None
+            if self.rec_start is not None:
+                self.toggle_record()
+            self.status.set("수집을 멈췄어요. 그래프는 마지막 데이터를 보여 줘요.")
+        self.btn_stop.config(state=tk.DISABLED)
+        self.btn_rec.config(state=tk.DISABLED)
+        self.btn_connect.config(state=tk.NORMAL)
+        self.btn_demo.config(state=tk.NORMAL)
+
+    def toggle_record(self):
+        snap = self.buf.snapshot()
+        now = snap.t[-1] if len(snap) else 0.0
+        if self.rec_start is None:
+            self.rec_start = now
+            self.recorded = None
+            self.btn_rec.config(text="■ 기록 정지")
+            self.status.set(f"기록 중… (t = {now:.1f} s부터)")
+        else:
+            ds = self.buf.snapshot(title="recording", since=self.rec_start)
+            ds = sl.Dataset(ds.title, ds.t[ds.t <= now], {k: (v[:np.sum(ds.t <= now)], u) for k, (v, u) in ds.channels.items()})
+            self.recorded = ds
+            self.rec_start = None
+            self.btn_rec.config(text="● 기록 시작")
+            self.status.set(f"기록 완료: {len(ds)}개 점, {ds.t[-1]-ds.t[0]:.1f} s. '엑셀로 내보내기'로 저장할 수 있어요." if len(ds) > 1 else "기록된 데이터가 없어요.")
+
     # ---------------------------------------------------------------- 갱신
     def _tick(self):
-        # 설정이 바뀌었을 때만 다시 그림 (슬라이더를 움직일 때마다 그리면 느려짐)
         try:
+            if self.source is not None:
+                err = getattr(self.source, "error", None)
+                if err:
+                    self.stop_live()
+                    messagebox.showerror("연결 오류", f"phyphox에 연결하지 못했어요.\n\n{err}\n\n"
+                                         "폰과 PC가 같은 와이파이인지, 앱에서 원격 접속을 켰는지, 주소가 맞는지 확인해 주세요.")
+                elif self.source.running.is_set():
+                    snap = self.buf.snapshot(title=getattr(self.source, "title", "live"))
+                    if len(snap):
+                        if len(snap.t) and snap.t[-1] > self.v_window.get():
+                            snap = self._window(snap, snap.t[-1] - self.v_window.get())
+                        self._set_dataset(snap, keep_selection=True)
+                        if self.rec_start is not None:
+                            self.status.set(f"기록 중… {snap.t[-1] - self.rec_start:.1f} s")
             if self._dirty and self.ds is not None:
                 self._dirty = False
                 self.redraw()
         finally:
             self.after(200, self._tick)
+
+    @staticmethod
+    def _window(ds, t_from):
+        m = ds.t >= t_from
+        return sl.Dataset(ds.title, ds.t[m], {k: (v[m], u) for k, (v, u) in ds.channels.items()})
 
     def redraw(self):
         ds = self.ds
@@ -220,7 +307,7 @@ class Dashboard(tk.Tk):
 
     # -------------------------------------------------------------- 내보내기
     def export(self):
-        ds = self.ds
+        ds = self.recorded or self.ds
         if ds is None or len(ds) < 2:
             messagebox.showinfo("내보내기", "내보낼 데이터가 없어요.")
             return
@@ -250,12 +337,17 @@ class Dashboard(tk.Tk):
         return processed, rows
 
     def _on_close(self):
+        if self.source:
+            self.source.stop()
         self.destroy()
 
 
 def main():
     app = Dashboard()
-    files = [a for a in sys.argv[1:] if not a.startswith("--")]
+    args = sys.argv[1:]
+    if "--demo" in args:
+        app.after(300, app.start_demo)
+    files = [a for a in args if not a.startswith("--")]
     if files:
         app.after(300, lambda: app.open_csv(files[0]))
     app.mainloop()

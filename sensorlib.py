@@ -6,11 +6,16 @@ GUI(sensor_dashboard.py)와 분리해서, 데이터 읽기·처리·내보내기
     읽기      : phyphox에서 내보낸 CSV (쉼표·세미콜론·탭 구분, 소수점 쉼표 모두 지원)
     처리      : 이상치 제거(Hampel 필터), 이동평균, 통계, FFT 주 주파수, 기압 → 고도 변환
     내보내기  : XLSX(openpyxl) 또는 CSV
+    실시간    : phyphox 원격 접속(REST API) 또는 시뮬레이션 데이터를 별도 스레드에서 수집
 """
 import csv
 import io
+import json
 import math
 import re
+import threading
+import time
+import urllib.request
 
 import numpy as np
 
@@ -237,3 +242,186 @@ def _cell(v):
     if isinstance(v, np.integer):
         return int(v)
     return v
+
+
+# ============================================================================
+# 실시간 수집
+# ============================================================================
+class LiveBuffer:
+    """수집 스레드가 쓰고 GUI가 읽는 공유 버퍼. 잠금(lock)으로 동시에 접근해도 데이터가 꼬이지 않게 한다."""
+
+    def __init__(self, max_points=200_000):
+        self.lock = threading.Lock()
+        self.max_points = max_points
+        self.clear()
+
+    def clear(self):
+        with getattr(self, "lock", threading.Lock()):
+            self.t = []
+            self.cols = {}
+            self.units = {}
+
+    def setup(self, units):
+        with self.lock:
+            self.t, self.cols, self.units = [], {k: [] for k in units}, dict(units)
+
+    def extend(self, t, values):
+        """t: 시간 리스트, values: {채널: 값 리스트} (길이가 t와 같아야 함)"""
+        with self.lock:
+            self.t.extend(t)
+            for k, v in values.items():
+                self.cols[k].extend(v)
+            extra = len(self.t) - self.max_points
+            if extra > 0:
+                del self.t[:extra]
+                for k in self.cols:
+                    del self.cols[k][:extra]
+
+    def snapshot(self, title="live", since=None):
+        with self.lock:
+            t = np.array(self.t)
+            ch = {k: (np.array(v), self.units[k]) for k, v in self.cols.items()}
+        if since is not None and len(t):
+            m = t >= since
+            t = t[m]
+            ch = {k: (v[m], u) for k, (v, u) in ch.items()}
+        return Dataset(title, t, ch)
+
+
+class SimulatedSource(threading.Thread):
+    """phyphox 없이 시험할 수 있는 가짜 센서. 진자처럼 2 Hz로 흔들리는 가속도 + 가끔 튀는 값,
+    천천히 바뀌는 조도, 계단을 오르듯 내려가는 기압을 50 Hz로 만든다."""
+
+    def __init__(self, buf, rate=50.0):
+        super().__init__(daemon=True)
+        self.buf, self.rate = buf, rate
+        self.running = threading.Event()
+        self.error = None
+        self.rng = np.random.default_rng()
+
+    def run(self):
+        units = {"Acceleration x": "m/s^2", "Acceleration y": "m/s^2", "Acceleration z": "m/s^2",
+                 "Illuminance": "lx", "Pressure": "hPa"}
+        self.buf.setup(units)
+        self.running.set()
+        t0, n = time.time(), 0
+        while self.running.is_set():
+            now = time.time() - t0
+            ts, vals = [], {k: [] for k in units}
+            while n / self.rate <= now:
+                t = n / self.rate
+                ax = 1.5 * math.sin(2 * math.pi * 2.0 * t) * math.exp(-t / 40) + self.rng.normal(0, 0.15)
+                if self.rng.random() < 0.01:
+                    ax += self.rng.choice([-1, 1]) * self.rng.uniform(4, 8)   # 튀는 값 (이상치)
+                ts.append(t)
+                vals["Acceleration x"].append(ax)
+                vals["Acceleration y"].append(0.3 * math.sin(2 * math.pi * 2.0 * t + 1) + self.rng.normal(0, 0.1))
+                vals["Acceleration z"].append(9.81 + self.rng.normal(0, 0.1))
+                vals["Illuminance"].append(300 + 150 * math.sin(2 * math.pi * 0.05 * t) + self.rng.normal(0, 5))
+                vals["Pressure"].append(1013.0 - 0.012 * min(t, 30) * 3 + self.rng.normal(0, 0.008))  # 약 3 m 상승
+                n += 1
+            if ts:
+                self.buf.extend(ts, vals)
+            time.sleep(0.05)
+
+    def stop(self):
+        self.running.clear()
+
+
+def guess_unit(buffer_name):
+    """phyphox 버퍼 이름으로 단위 추정 (실시간 연결은 단위 정보를 주지 않음)"""
+    n = buffer_name.lower()
+    for key, unit in (("acc", "m/s^2"), ("gyr", "rad/s"), ("mag", "µT"), ("illum", "lx"), ("light", "lx"),
+                      ("press", "hPa"), ("prox", "cm"), ("temp", "°C")):
+        if key in n:
+            return unit
+    return ""
+
+
+class PhyphoxSource(threading.Thread):
+    """phyphox 앱의 '원격 접속(Remote access)'으로 데이터를 받아온다.
+
+    /config 로 버퍼 이름을 알아내고, /get?시간버퍼=마지막시각&값버퍼=마지막시각|시간버퍼 형식으로
+    새로 쌓인 값만 반복해서 가져온다 (phyphox 원격 인터페이스 문서의 threshold 방식)."""
+
+    def __init__(self, buf, address, interval=0.2, start_measuring=True):
+        super().__init__(daemon=True)
+        address = address.strip()
+        if not address.startswith("http"):
+            address = "http://" + address
+        self.base = address.rstrip("/")
+        self.buf, self.interval, self.start_measuring = buf, interval, start_measuring
+        self.running = threading.Event()
+        self.error = None
+        self.groups = {}      # 시간 버퍼 → [값 버퍼들]
+        self.session = None
+
+    def _get(self, path, timeout=3.0):
+        with urllib.request.urlopen(self.base + path, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    @staticmethod
+    def group_buffers(names):
+        """버퍼 이름 목록을 시간 버퍼별로 묶는다. 예: accX, accY, accZ, acc_time → {acc_time: [accX, accY, accZ]}"""
+        times = [n for n in names if n.lower().endswith("time") or n.lower() in ("t",)]
+        groups = {}
+        for n in names:
+            if n in times:
+                continue
+            stem = re.sub(r"[_]?[xyzXYZ]$", "", n)
+            match = next((tb for tb in times if tb.lower().startswith(stem.lower())), None)
+            if match is None and len(times) == 1:
+                match = times[0]
+            if match:
+                groups.setdefault(match, []).append(n)
+        return groups
+
+    def connect(self):
+        cfg = self._get("/config")
+        names = [b["name"] for b in cfg.get("buffers", [])]
+        self.groups = self.group_buffers(names)
+        if not self.groups:
+            raise RuntimeError(f"시간 버퍼를 찾지 못했어요. 버퍼 목록: {', '.join(names)}")
+        return cfg.get("localTitle") or cfg.get("title") or "phyphox"
+
+    def run(self):
+        try:
+            title = self.connect()
+            self.title = title
+            # 시간 버퍼가 여러 개면 첫 번째 그룹만 사용 (센서마다 측정 시각이 달라서 한 축에 못 합침)
+            tb = next(iter(self.groups))
+            vals = self.groups[tb]
+            self.buf.setup({v: guess_unit(v) for v in vals})
+            if self.start_measuring:
+                self._get("/control?cmd=start")
+            self.running.set()
+            last = None
+            while self.running.is_set():
+                if last is None:
+                    q = "&".join([f"{tb}=full"] + [f"{v}=full" for v in vals])
+                else:
+                    q = "&".join([f"{tb}={last!r}"] + [f"{v}={last!r}|{tb}" for v in vals])
+                d = self._get("/get?" + q)
+                sess = d.get("status", {}).get("session")
+                if self.session is not None and sess != self.session:   # 앱에서 데이터를 지우면 세션이 바뀜
+                    self.buf.setup({v: guess_unit(v) for v in vals})
+                    last = None
+                self.session = sess
+                tt = d["buffer"][tb]["buffer"]
+                cols = {v: d["buffer"][v]["buffer"] for v in vals}
+                m = min([len(tt)] + [len(c) for c in cols.values()])
+                if last is not None and m:          # 경계값이 한 번 더 오는 경우를 대비해 중복 제거
+                    k = 0
+                    while k < m and tt[k] is not None and tt[k] <= last:
+                        k += 1
+                    tt, cols, m = tt[k:m], {v: c[k:m] for v, c in cols.items()}, m - k
+                if m:
+                    self.buf.extend(tt[:m], {v: c[:m] for v, c in cols.items()})
+                    last = tt[m - 1]
+                time.sleep(self.interval)
+        except Exception as e:   # 연결 실패·끊김은 GUI에서 표시
+            self.error = e
+            self.running.clear()
+
+    def stop(self):
+        self.running.clear()
